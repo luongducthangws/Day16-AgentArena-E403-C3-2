@@ -70,7 +70,59 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+_WS_RE = re.compile(r"\s+")
+
+#: Liên từ mà mô hình dùng để dán hai nửa câu của HAI tài liệu khác nhau
+#: thành một câu không tài liệu nào nói (flaw 3b). `" và "` là chỗ dán của
+#: `MockModel`; ba cái còn lại là những chỗ dán một mô hình thật hay dùng.
+#: Chỗ dán sai không gây hại: cả hai nửa đều phải qua kiểm tra bên dưới.
+_GLUES = (" và ", " còn ", " nhưng ", " trong khi ")
+
+#: `arena.scorer.MIN_SUPPORT_CHARS` — ngắn hơn thế thì scorer không coi là
+#: trích dẫn, nên cắt ra một nửa ngắn hơn ngưỡng này là vô ích.
+_MIN_QUOTE_CHARS = 12
+
+_ABSTAIN_ANSWER = (
+    "Không đủ căn cứ: các tài liệu đã truy xuất không chứa câu trả lời cho "
+    "câu hỏi này, nên tôi không đưa ra kết luận."
+)
+
+
+def _norm(text) -> str:
+    """Dạng chuẩn hoá mà scorer so sánh trên đó (`arena.scorer._norm`).
+
+    Chỉ casefold + gộp khoảng trắng: một paraphrase vẫn trượt, nhưng một
+    câu mô hình thật xuống dòng giữa chừng thì không bị oan.
+    """
+    if not isinstance(text, str):
+        return ""
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
+
+
+def _doc_lines(ctx) -> dict:
+    """`{doc_id: (dòng đã chuẩn hoá, ...)}` cho mọi tài liệu trong corpus.
+
+    Theo DÒNG, không theo cả thân bài: scorer chỉ công nhận trích dẫn nằm
+    gọn trong MỘT dòng, nên một câu vắt qua hai dòng vẫn là `HALLUCINATED`.
+    """
+    corpus = getattr(ctx, "corpus", None)
+    docs = getattr(corpus, "docs", None)
+    if not docs:
+        return {}
+    lines = {}
+    for doc in docs:
+        doc_id = getattr(doc, "doc_id", None)
+        body = getattr(doc, "body", None)
+        if isinstance(doc_id, str) and isinstance(body, str):
+            lines[doc_id] = tuple(
+                line for line in (_norm(raw) for raw in body.splitlines()) if line
+            )
+    return lines
 
 
 class Critic(Middleware):
@@ -79,16 +131,109 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        observed = _norm(getattr(ctx, "observed_text", ""))
+        lines = _doc_lines(ctx)
+
+        kept, dropped, unfused = [], 0, 0
+        for claim in claims:
+            if not isinstance(claim, dict):
+                dropped += 1
+                continue
+            text = _norm(claim.get("text"))
+            if self._quotes(text, observed, lines):
+                kept.append(claim)          # chữ của mô hình: KHÔNG đụng vào
+                continue
+            halves = self._unfuse(claim.get("text"), observed, lines)
+            if halves:
+                # Cắt bớt là phép sửa hợp lệ duy nhất: mỗi nửa vẫn là một
+                # substring nguyên văn của chính câu mô hình đã viết.
+                kept.extend(dict(claim, text=part, doc_id=doc_id) for part, doc_id in halves)
+                unfused += 1
+            else:
+                dropped += 1               # không bằng chứng nào đỡ: bịa
+
+        report["claims"] = kept
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = _ABSTAIN_ANSWER
+        elif unfused:
+            # Hai nguồn nói khác nhau. Nêu cả hai vế rồi từ chối chốt một
+            # bên là câu trả lời được hiệu chỉnh đúng, không phải né tránh.
+            report["abstain"] = True
+        report["citations"] = sorted(
+            {
+                c["doc_id"]
+                for c in kept
+                if isinstance(c.get("doc_id"), str) and c["doc_id"]
+            }
+        )
+
+        state = getattr(ctx, "state", None)
+        if isinstance(state, dict):
+            state["critic"] = {"kept": len(kept), "dropped": dropped, "unfused": unfused}
+        return report
+
+    # -- tín hiệu ------------------------------------------------------
+
+    @staticmethod
+    def _quotes(text: str, observed: str, lines: dict) -> bool:
+        """Câu này có phải trích dẫn thật của thứ agent đã đọc không?
+
+        Hai vế, và scorer đòi cả hai: lượt chạy phải CHỨNG MINH được là đã
+        nhìn thấy câu đó (`observed`), và câu đó phải nằm gọn trong MỘT
+        dòng của một tài liệu nào đó. Thiếu vế sau là `HALLUCINATED` —
+        mất trọn 15 điểm honesty, kể cả khi câu nghe rất hợp lý.
+        """
+        if len(text) < _MIN_QUOTE_CHARS or text not in observed:
+            return False
+        if not lines:  # không có corpus để đối chiếu: tin vào quan sát
+            return True
+        return any(text in line for doc_lines in lines.values() for line in doc_lines)
+
+    @classmethod
+    def _source(cls, text: str, observed: str, lines: dict) -> str:
+        """doc_id của tài liệu THẬT SỰ chứa câu này, hoặc chuỗi rỗng.
+
+        Chỉ nhận tài liệu đã về nguyên vẹn từ một lần fetch sạch (dòng
+        chứa câu đó cũng phải có mặt trong quan sát) — gắn vào một tài
+        liệu lượt chạy chưa từng đọc bị chấm `UNRETRIEVED`.
+        """
+        for doc_id, doc_lines in lines.items():
+            for line in doc_lines:
+                if text in line and line in observed:
+                    return doc_id
+        return ""
+
+    @classmethod
+    def _unfuse(cls, text, observed: str, lines: dict):
+        """Hai nửa hợp lệ của một câu bị ghép từ hai nguồn, hoặc None.
+
+        Cắt đúng chỗ dán thì mỗi nửa vẫn là chữ của mô hình VÀ là trích
+        dẫn nguyên văn của một dòng. Điều kiện nghiệm thu chặt và cố ý
+        như vậy: hai nửa phải thuộc HAI tài liệu KHÁC NHAU, đúng chữ ký
+        của một câu ghép mâu thuẫn. Cắt sai thì một nửa vắt qua hai tài
+        liệu và không nguồn nào nhận nó.
+        """
+        if not isinstance(text, str) or not lines:
+            return None
+        for glue in _GLUES:
+            start = text.find(glue)
+            while start != -1:
+                left, right = text[:start].strip(), text[start + len(glue):].strip()
+                pair = [
+                    (part, cls._source(_norm(part), observed, lines))
+                    for part in (left, right)
+                ]
+                if all(
+                    doc_id and len(_norm(part)) >= _MIN_QUOTE_CHARS
+                    for part, doc_id in pair
+                ) and pair[0][1] != pair[1][1]:
+                    return pair
+                start = text.find(glue, start + 1)
+        return None
