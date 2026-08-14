@@ -92,6 +92,27 @@ _ABSTAIN_ANSWER = (
     "câu hỏi này, nên tôi không đưa ra kết luận."
 )
 
+#: Nhắc một lượt, gắn vào đường RA model — tự phê bình TRƯỚC khi chốt thay vì
+#: dọn dẹp sau. Đo trên model thật (gpt-5.6-luna, 9 brief công khai):
+#: precision 1.00 khắp nơi nhưng `covering_claims` = 0 trên 7/9, vì model chép
+#: ĐÚNG NGUYÊN VĂN nhưng chỉ chép NỬA DÒNG — `arena.scorer._covers` đòi đủ mọi
+#: token số và 60% token chữ của required fact, nên nửa dòng được 0 điểm recall
+#: y như một câu bịa. Cùng lúc đó 7/9 lượt chạy chỉ tiêu 3/8 lượt tool.
+#:
+#: Đây là nội dung CHUNG, không dính brief nào: không tên tài liệu, không doc_id,
+#: không chép chữ nào của corpus vào ngữ cảnh (dán bằng chứng vào prompt là thứ
+#: `unaccounted_chars` trên trace bóc ra được).
+_NUDGE = (
+    "NHẮC GIAO THỨC (đây KHÔNG phải câu hỏi mới, đừng tìm kiếm nội dung của nó): "
+    "mỗi phần tử claims phải chép TRỌN VẸN MỘT DÒNG của tài liệu — từ ký tự đầu "
+    "dòng tới ký tự cuối dòng, giữ nguyên cả các vế sau dấu chấm phẩy và câu cuối "
+    "cùng của dòng đó. Chép thiếu nửa sau bị chấm là KHÔNG trả lời được câu hỏi, "
+    "dù nửa đầu đúng từng ký tự. Hãy nộp 2–4 claims lấy từ các tài liệu KHÁC NHAU. "
+    "Chỉ viết dòng FINAL sau khi đã fetch_doc ít nhất hai tài liệu khác nhau; nếu "
+    "kết quả tìm kiếm đầu chưa chứa con số/thời hạn được hỏi, hãy tìm lại bằng từ "
+    "ngữ khác trước khi kết luận."
+)
+
 
 def _norm(text) -> str:
     """Dạng chuẩn hoá mà scorer so sánh trên đó (`arena.scorer._norm`).
@@ -129,6 +150,22 @@ class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
+
+    def before_model(self, ctx, messages):
+        """Nhắc một lượt: chép TRỌN dòng, nhiều nguồn, đọc đủ rồi hãy chốt.
+
+        Chỉ gắn từ lượt 1 trở đi. Ở lượt 0 lịch sử chưa có message assistant
+        nào, mà `arena.model._first_user_content` đọc message user cuối cùng
+        TRƯỚC lượt assistant đầu tiên làm câu hỏi — nhắc ở đó thì lời nhắc
+        biến thành truy vấn tìm kiếm cho cả lượt chạy.
+
+        `messages + [...]` chứ không mutate: agent giữ lịch sử chuẩn riêng
+        (xem `harness/agent.py`), nên đây là nhắc MỘT lượt chứ không phải
+        một message vĩnh viễn.
+        """
+        if getattr(ctx, "step", 0) < 1:
+            return messages
+        return messages + [{"role": "user", "content": _NUDGE}]
 
     def after_agent(self, ctx, report):
         if not isinstance(report, dict):
